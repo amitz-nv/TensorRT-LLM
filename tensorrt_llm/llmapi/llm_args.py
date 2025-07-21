@@ -641,11 +641,12 @@ class PeftCacheConfig(BaseModel, PybindMirror):
         default=0,
         description=
         "number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache"
-    )
+        ", affects host cache size and overrides value of host_cache_size")
     num_device_module_layer: int = Field(
         default=0,
         description=
         "number of max sized 1-layer 1-module sets of weights that can be stored in host cache"
+        ", affects device cache size and overrides value of device_cache_percent"
     )
     optimal_adapter_size: int = Field(
         default=
@@ -697,6 +698,24 @@ class PeftCacheConfig(BaseModel, PybindMirror):
             device_cache_percent=self.device_cache_percent,
             host_cache_size=self.host_cache_size,
             lora_prefetch_dir=self.lora_prefetch_dir)
+
+    @staticmethod
+    def create_from_pybind(
+            peft_cache_config: _PeftCacheConfig) -> "PeftCacheConfig":
+        return PeftCacheConfig(
+            num_host_module_layer=peft_cache_config.num_host_module_layer,
+            num_device_module_layer=peft_cache_config.num_device_module_layer,
+            optimal_adapter_size=peft_cache_config.optimal_adapter_size,
+            max_adapter_size=peft_cache_config.max_adapter_size,
+            num_put_workers=peft_cache_config.num_put_workers,
+            num_ensure_workers=peft_cache_config.num_ensure_workers,
+            num_copy_streams=peft_cache_config.num_copy_streams,
+            max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
+            max_pages_per_block_device=peft_cache_config.
+            max_pages_per_block_device,
+            device_cache_percent=peft_cache_config.device_cache_percent,
+            host_cache_size=peft_cache_config.host_cache_size,
+            lora_prefetch_dir=peft_cache_config.lora_prefetch_dir)
 
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
@@ -1019,20 +1038,6 @@ class BaseLlmArgs(BaseModel):
 
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
-
-    max_lora_rank: Optional[int] = Field(
-        default=None,
-        description="The maximum LoRA rank.",
-        deprecated="Use lora_config.max_lora_rank instead.")
-
-    max_loras: int = Field(default=4,
-                           description="The maximum number of LoRA.",
-                           deprecated="Use lora_config.max_loras instead.")
-
-    max_cpu_loras: int = Field(
-        default=4,
-        description="The maximum number of LoRA on CPU.",
-        deprecated="Use lora_config.max_cpu_loras instead.")
 
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
@@ -1416,10 +1421,10 @@ class BaseLlmArgs(BaseModel):
         if self.parallel_config._world_size == 1 and self.build_config:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
+        if self.enable_lora and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
-            if self.max_lora_rank is not None:
-                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
+            if self.lora_config is not None:
+                self.build_config.lora_config.max_lora_rank = self.lora_config.max_lora_rank
 
         if hasattr(self,
                    'enable_prompt_adapter') and self.enable_prompt_adapter:
@@ -1524,16 +1529,6 @@ class BaseLlmArgs(BaseModel):
     @model_validator(mode="after")
     def validate_lora_config_consistency(self):
         if self.lora_config:
-            if self.max_lora_rank is not None:
-                logger.warning(
-                    "max_lora_rank is ignored when lora_config is provided.")
-            if self.max_loras != self.lora_config.max_loras:
-                logger.warning(
-                    "max_loras is ignored when lora_config is provided.")
-            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
-                logger.warning(
-                    "max_cpu_loras is ignored when lora_config is provided.")
-
             if len(self.lora_config.lora_dir) == 0:
                 # TODO [TRTLLM-5173]
                 logger.warning(

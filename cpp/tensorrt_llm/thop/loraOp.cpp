@@ -52,7 +52,8 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     std::vector<th::Tensor> const& lora_ranks, // numModules tensors, each tensors has single value
     std::vector<th::Tensor> const& lora_weights_pointers, th::Tensor const& host_context_lengths,
     std::vector<int64_t> const& output_hidden_sizes, bool transA, bool transB, int64_t const max_low_rank,
-    int64_t const& weight_index, bool isRemoveInputPadding)
+    int64_t const& weight_index, bool isRemoveInputPadding, std::optional<std::vector<int64_t>> const& output_ptrs,
+    std::optional<th::Tensor> const& workspace_tensor)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -161,11 +162,17 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     mLoraImpl->setBestTactic(std::nullopt);
 
     auto const workspace_size = mLoraImpl->getWorkspaceSize(numTokens, numReqs, loraRuntimeDataType);
+    TLLM_LOG_INFO("ZUKER - lora_grouped_gemm - workspace_size=%ld", workspace_size);
 
     auto workspace = torch::empty(std::vector<int64_t>{static_cast<int64_t>(workspace_size)}, input.options());
 
+    void* const* outputsPtr = output_ptrs.has_value() ? reinterpret_cast<void* const*>(output_ptrs.value().data())
+                                                      : reinterpret_cast<void* const*>(output.data());
+    void* workspacePtr = workspace_tensor.has_value() ? workspace_tensor.value().data_ptr() : workspace.data_ptr();
+
+    TLLM_LOG_INFO("ZUKER - lora_grouped_gemm - outputsPtr=%p, workspacePtr=%p", outputsPtr, workspacePtr);
     mLoraImpl->run(numTokens, numReqs, input.data_ptr(), expandLoraRanks.data(), expandLoraWeightPtrs.data(),
-        weight_index, output.data(), workspace.data_ptr(), stream);
+        weight_index, outputsPtr, workspacePtr, stream);
     sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -187,7 +194,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "bool transB, "
         "int max_low_rank, "
         "int weight_index, "
-        "bool isRemoveInputPadding) -> Tensor[]");
+        "bool isRemoveInputPadding, "
+        "int []? output_ptrs, "
+        "Tensor? workspace_tensor"
+        ") -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

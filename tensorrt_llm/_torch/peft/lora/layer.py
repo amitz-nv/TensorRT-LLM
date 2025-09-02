@@ -92,6 +92,24 @@ class LoraLayer(torch.nn.Module):
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
 
+        if self.output_hidden_sizes:
+            #print(f"ZUKER - LoraLayer.__init__ - {self.output_hidden_sizes=}")
+            # TODO: Does device="cuda" work with TP>1?
+            self._workspace_tensor = torch.zeros(33560000,
+                                                 dtype=torch.uint8,
+                                                 device="cuda")
+
+            self._max_num_tokens = 256  # TODO: Get real value from somewhere
+            self._output_tensors = [
+                torch.zeros((self._max_num_tokens, self.output_hidden_sizes[i]),
+                            dtype=torch.float16,
+                            device="cuda")
+                for i in range(len(self.output_hidden_sizes))
+            ]
+            self._output_tensors_ptrs = [
+                t.data_ptr() for t in self._output_tensors
+            ]
+
     def forward(
         self,
         x,
@@ -100,12 +118,14 @@ class LoraLayer(torch.nn.Module):
     ) -> Optional[torch.Tensor]:
 
         if bool(lora_params):
+            #print(f"ZUKER - LoraLayer.forward - {x.dtype=}, {layer_idx=}, {lora_params[layer_idx]=}")
             lora_ranks = []
             lora_weight_pointers = []
             active_lora_module_ids = []
             for module_idx in self.lora_module_types:
                 module_idx = int(module_idx)
                 if module_idx in lora_params[layer_idx]:
+                    #print(f"ZUKER - LoraLayer.forward - {layer_idx=}, {module_idx=}")
                     active_lora_module_ids.append(module_idx)
                     lora_ranks.append(
                         lora_params[layer_idx][module_idx]['adapter_size'])
@@ -117,7 +137,8 @@ class LoraLayer(torch.nn.Module):
             if len(active_lora_module_ids) == 0:
                 return None
             else:
-                lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
+                #print(f"ZUKER - LoraLayer.forward - {num_seqs=}, {x.shape=}, {lora_ranks=}")
+                torch.ops.trtllm.lora_grouped_gemm(
                     x,
                     lora_params['host_request_types'][:num_seqs],
                     lora_ranks,
@@ -126,31 +147,42 @@ class LoraLayer(torch.nn.Module):
                     self.output_hidden_sizes,
                     False,  # transA
                     True,  # transB
-                    max([r.max() for r in lora_ranks]),
+                    8,  #max([r.max() for r in lora_ranks]),
                     0,
                     True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
+                    self._output_tensors_ptrs,  # output_ptrs
+                    self._workspace_tensor,  # workspace_tensor
                 )
-                if isinstance(lora_outputs, torch.Tensor):
-                    return lora_outputs
-                else:
-                    # For multiple LoRA modules, some might not be executed in grouped gemm.
-                    # For those modules not executed, we create zero tensors with matching dimensions.
-                    # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
-                    lora_output = []
-                    for module_idx in self.lora_module_types:
-                        if int(module_idx) in active_lora_module_ids:
-                            lora_output.append(lora_outputs.pop(0))
-                        else:
-                            lora_output.append(
-                                torch.zeros(list(x.shape[:-1]) + [
-                                    self.output_hidden_sizes[
-                                        self.lora_module_types.index(
-                                            module_idx)]
-                                ],
-                                            dtype=x.dtype,
-                                            device=x.device))
-                    lora_output = torch.cat(lora_output, dim=-1)
-                    return lora_output
+                lora_outputs = self._output_tensors[:len(self.
+                                                         output_hidden_sizes)]
+                #print(f"ZUKER - LoraLayer.forward - {self.output_hidden_sizes=}")
+                #print(f"ZUKER - LoraLayer.forward - {[hex(a) for a in self._output_tensors_ptrs]}")
+                #print(f"ZUKER - LoraLayer.forward - {lora_outputs=}")
+                #if isinstance(lora_outputs, torch.Tensor):
+                #    return lora_outputs
+                #else:
+                # For multiple LoRA modules, some might not be executed in grouped gemm.
+                # For those modules not executed, we create zero tensors with matching dimensions.
+                # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
+                # NOTE: For example: /home/scratch.trt_llm_data/llm-models/llama-models/luotuo-lora-7b-0.1 doesn't have
+                #       anything for ATTENTION_K
+                lora_output = []
+                idx = 0
+                for module_idx in self.lora_module_types:
+                    if int(module_idx) in active_lora_module_ids:
+                        lora_output.append(lora_outputs[idx][:x.shape[0]])
+                        idx += 1
+                    else:
+                        lora_output.append(
+                            torch.zeros(list(x.shape[:-1]) + [
+                                self.output_hidden_sizes[
+                                    self.lora_module_types.index(module_idx)]
+                            ],
+                                        dtype=x.dtype,
+                                        device=x.device))
+                #print(f"ZUKER - LoraLayer.forward - {[w.shape for w in lora_output]=}")
+                lora_output = torch.cat(lora_output, dim=-1)
+                return lora_output
 
         else:
             return None

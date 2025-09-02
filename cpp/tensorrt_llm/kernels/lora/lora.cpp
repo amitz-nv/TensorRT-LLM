@@ -185,7 +185,8 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
             }
         }
     }
-
+    // TODO ZUKER: Add an argument to this function that would make it false
+    useUnifiedGemm = false;
     // TODO can add batch_size == 1 case
     if (useUnifiedGemm)
     {

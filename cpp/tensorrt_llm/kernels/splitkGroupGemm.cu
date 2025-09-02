@@ -105,7 +105,24 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problemSizes, std:
     auto offset_size = getOffsetSize(problemCount);
     auto out_ptr_size = ptr_size;
 
-    char* host_workspace = (char*) std::malloc(gemmParamsWorkSpaceSize);
+    // TODO: Pass this as an argument instead, as I believe the workspace size may different in different layers,
+    //       also, this device memory is never release when it's a static variable.
+    thread_local char* host_workspace = nullptr;
+    if (host_workspace == nullptr)
+    {
+        // x10 just to make sure it's large enough, in the cast 1st call passed a relatively small
+        // gemmParamsWorkSpaceSize Allocate as pinned memory to speed up the memcpy
+        TLLM_LOG_INFO("ZUKER - splitkGroupedGemm_ - Calling cudaMallocHost for host_workspace, size: %ld", 33560000);
+        cudaError_t err = cudaMallocHost((void**) &host_workspace, 33560000);
+        if (err != cudaSuccess)
+        {
+            // Handle error
+            TLLM_LOG_ERROR("cudaMallocHost failed in %s, err code: %d", __PRETTY_FUNCTION__, err);
+            throw std::bad_alloc();
+        }
+    }
+    TLLM_LOG_INFO("ZUKER - splitkGroupedGemm_ - host_workspace=%p", host_workspace);
+
     cutlass::gemm::GemmCoord* problem_sizes_host = reinterpret_cast<cutlass::gemm::GemmCoord*>(host_workspace);
     ElementA** ptr_A_host = reinterpret_cast<ElementA**>(host_workspace + gemm_coord_size);
     ElementB** ptr_B_host = reinterpret_cast<ElementB**>(host_workspace + gemm_coord_size + ptr_size);
@@ -192,7 +209,6 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problemSizes, std:
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to run CUTLASS Grouped GEMM kernel.");
     sync_check_cuda_error(stream);
 
-    std::free(host_workspace);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

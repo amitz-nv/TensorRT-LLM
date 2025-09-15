@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch._dynamo.config
 
+import tensorrt_llm
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
@@ -66,6 +68,8 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
 from .scheduler import ScheduledRequests
 
 MAX_UINT64 = (1 << 64) - 1
+# layer_idx -> tuple of output hidden layers -> info dict
+LoraMetadata = dict[int, dict[tuple[int, ...], dict[str, Any]]]
 
 
 class ModelEngine(ABC):
@@ -294,6 +298,10 @@ class PyTorchModelEngine(ModelEngine):
         self.is_spec_decode = spec_config is not None
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
+        self.lora_config = lora_config
+        # TODO ZUKER: I'm not sure this gets None when there's no LoRA - need to check this flow
+        self.is_lora_enabled = lora_config is not None
+        print(f"ZUKER - PyTorchModelEngine.__init__ - {lora_config=}")
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -444,6 +452,10 @@ class PyTorchModelEngine(ModelEngine):
                                              dtype=torch.int,
                                              device='cuda')
         self.iter_counter = 0
+
+        # TODO ZUKER: I'm not sure the size is correct, and try to find something better than this
+        self.lora_weights_in_tensor = torch.zeros(64*64*8, dtype=torch.int8, device='cuda')
+        self.lora_weights_out_tensor = torch.zeros(64*64*8, dtype=torch.int8, device='cuda')
 
         # We look up this key in resource_manager during forward to find the
         # kv cache manager. Can be changed to support multiple model engines
@@ -601,6 +613,10 @@ class PyTorchModelEngine(ModelEngine):
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
                         request_ids=list(range(batch_size)))
+
+                dummy_lora_task_layer_module_configs = self.create_dummy_lora_task_layer_module_configs()
+                for req in requests:
+                    req.py_lora_task_layer_module_configs = dummy_lora_task_layer_module_configs
             else:
                 result = None
             return result
@@ -673,6 +689,14 @@ class PyTorchModelEngine(ModelEngine):
                     spec_resource_manager.add_dummy_requests(request_ids=list(
                         range(num_ctx_requests, num_ctx_requests +
                               num_gen_tokens)))
+
+            dummy_lora_task_layer_module_configs = self.create_dummy_lora_task_layer_module_configs()
+            for req in gen_requests:
+                req.py_lora_task_layer_module_configs = dummy_lora_task_layer_module_configs
+
+            # TODO ZUKER: Not sure ctx_requests are relevant
+            #for req in ctx_requests:
+            #    req.py_lora_task_layer_module_configs = dummy_lora_task_layer_module_configs
 
             result = ScheduledRequests()
             result.context_requests = ctx_requests
@@ -1195,6 +1219,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
+            lora_metadata: Optional[LoraMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
         """
@@ -1557,7 +1582,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+            scheduled_requests, attn_metadata, lora_metadata)
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
@@ -1624,6 +1649,9 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
 
+        if lora_metadata is not None:
+            inputs['lora_metadata'] = lora_metadata
+
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
         self.iter_states['num_ctx_requests'] = num_ctx_requests
@@ -1636,7 +1664,8 @@ class PyTorchModelEngine(ModelEngine):
             self,
             scheduled_requests: ScheduledRequests,
             attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None):
+            spec_metadata: Optional[SpecMetadata] = None,
+            lora_metadata: Optional[LoraMetadata] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1732,7 +1761,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+            scheduled_requests, attn_metadata, lora_metadata)
 
         inputs = {
             'attn_metadata': attn_metadata,
@@ -2004,7 +2033,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_lora_params_from_requests(self,
                                        scheduled_requests: ScheduledRequests,
-                                       attn_metadata: AttentionMetadata):
+                                       attn_metadata: AttentionMetadata,
+                                       lora_metadata: Optional[LoraMetadata] = None):
         '''
         lora_params: dict
         {
@@ -2031,6 +2061,7 @@ class PyTorchModelEngine(ModelEngine):
             for module in request.py_lora_task_layer_module_configs:
                 module_id = module.module_id
                 layer_id = module.layer_id
+                print(f"ZUKER - _get_lora_params_from_requests - py_lora_task_layer_module_configs - {layer_id=}, {module_id=}")
 
                 if layer_id not in lora_params:
                     lora_params[layer_id] = {}
@@ -2086,11 +2117,82 @@ class PyTorchModelEngine(ModelEngine):
                     current_lora_params['adapter_size'])
                 current_lora_params['weight_pointers'] = torch.LongTensor(
                     current_lora_params['weight_pointers'])
+                print(f"ZUKER - _get_lora_params_from_requests - {layer_id=}, {module_id=}, {current_lora_params['weight_pointers']=}")
 
+        #print(f"ZUKER - _get_lora_params_from_requests - {(lora_metadata is not None)=}")
+        if lora_metadata is not None:
+            for layer_id, d in lora_params.items():
+                d.update(lora_metadata[layer_id])
+
+        torch.set_printoptions(threshold=1000)
         if lora_params:
             lora_params['host_request_types'] = attn_metadata.host_request_types
             lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
             lora_params['num_seqs'] = attn_metadata.num_seqs
+
+            SUPPORTED_MODULES_SET = {1,2,3}
+            if lora_metadata is not None:
+                # Prepare lora workspace for each LoRA module
+                for module in self.model.modules():
+                    if isinstance(module, LoraLayer):
+                        input_tensor = getattr(module, 'input_tensor', None)
+                        print(f"ZUKER - _get_lora_params_from_requests - processing {module.layer_idx=}, {module.lora_module_types=}, {module.output_hidden_sizes=}")
+                        if input_tensor is None:
+                            continue
+                        #print(f"ZUKER - _get_lora_params_from_requests - {input_tensor.shape=}")
+                        if SUPPORTED_MODULES_SET != set(module.lora_module_types):
+                            print("ZUKER - _get_lora_params_from_requests - skipping because irrelevant module types")
+                            continue
+
+                        lora_ranks, lora_weight_pointers, _ = \
+                            module.get_lora_ranks_weight_pointers_of_lora_module_types(lora_params,
+                                                                                       8,  # TODO ZUKER: Change this
+                                                                                       self.lora_weights_in_tensor.data_ptr(),
+                                                                                       self.lora_weights_out_tensor.data_ptr())
+
+                        # Pad to max BS
+                        for i, lora_rank_tensor in enumerate(lora_ranks):
+                            lora_ranks[i] = torch.cat((lora_rank_tensor, torch.zeros(self.batch_size - lora_rank_tensor.shape[0], dtype=torch.int)))
+                        for i, lora_weight_ptrs_tensor in enumerate(lora_weight_pointers):
+                            lora_weight_pointers[i] = torch.cat((lora_weight_ptrs_tensor, torch.zeros(self.batch_size * 3 - lora_weight_ptrs_tensor.shape[0], dtype=torch.long)))
+
+                        #if not lora_ranks:
+                        #    lora_ranks = [torch.zeros(self.batch_size, dtype=torch.int)]
+                        #    lora_weight_pointers = [torch.zeros(self.batch_size * 3, dtype=torch.long)]
+
+                        output_hidden_sizes_tuple = tuple(module.output_hidden_sizes)
+
+                        #print(f"ZUKER - _get_lora_params_from_requests - calling prepare_lora_gemms_workspace for {module.layer_idx=}, {output_hidden_sizes_tuple=}")
+                        current_lora_metadata = lora_metadata[module.layer_idx][output_hidden_sizes_tuple]
+                        workspace_tensor_host_splitk_group_gemm_tensor = current_lora_metadata['workspace_tensor_host_splitk_group_gemm']
+                        print(f"ZUKER - _get_lora_params_from_request - before prepare - {workspace_tensor_host_splitk_group_gemm_tensor.shape=}, {workspace_tensor_host_splitk_group_gemm_tensor.data_ptr()=}")
+                        print(f"ZUKER - _get_lora_params_from_request - before prepare - {workspace_tensor_host_splitk_group_gemm_tensor=}")
+                        #print(f"ZUKER - _get_lora_params_from_request - before prepare - {current_lora_metadata['workspace_tensor_device_splitk_group_gemm']=}, {current_lora_metadata['workspace_tensor_device_splitk_group_gemm'].shape=}")
+                        torch.ops.trtllm.prepare_lora_gemms_workspace(
+                            input_tensor,
+                            self.max_seq_len,
+                            self.max_num_tokens,
+                            lora_params['host_request_types'],
+                            lora_ranks,
+                            lora_weight_pointers,
+                            lora_params['prompt_lens_cpu'],
+                            module.output_hidden_sizes,
+                            False,  # transA
+                            True,  # transB
+                            self.lora_config.max_lora_rank,
+                            0,
+                            False,  #True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
+                            current_lora_metadata['output_tensors_ptrs'],
+                            current_lora_metadata['workspace_tensor_device_splitk_group_gemm'],
+                            current_lora_metadata['workspace_tensor_host_splitk_group_gemm'],
+                            current_lora_metadata['workspace_tensor_device_group_gemm'],
+                            current_lora_metadata['workspace_tensor_host_group_gemm'],
+                        )
+                        print(f"ZUKER - _get_lora_params_from_request - after prepare - {current_lora_metadata['workspace_tensor_host_splitk_group_gemm']=}")
+                        #print(f"ZUKER - _get_lora_params_from_request - after prepare - {current_lora_metadata['workspace_tensor_device_splitk_group_gemm']=}")
+
+        # Reset print options to default
+        torch.set_printoptions(profile='default')
 
         return lora_params
 
@@ -2101,6 +2203,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
+            lora_metadata: Optional[LoraMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
@@ -2112,7 +2215,7 @@ class PyTorchModelEngine(ModelEngine):
                 assert False, f'Unsupport cp_type {cp_type}'
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                           attn_metadata, spec_metadata,
+                                           attn_metadata, spec_metadata, lora_metadata,
                                            new_tensors_device,
                                            cache_indirection_buffer)
 
@@ -2164,20 +2267,24 @@ class PyTorchModelEngine(ModelEngine):
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager) as padded_requests:
 
-            maybe_graph, maybe_attn_metadata, maybe_spec_metadata = self.cuda_graph_runner.maybe_get_cuda_graph(
+            maybe_graph, maybe_attn_metadata, maybe_spec_metadata, maybe_lora_metadata = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests)
+            print(f"ZUKER - PyTorchModelEngine.forward - {maybe_graph=}, {maybe_lora_metadata is not None=}")
+
             if maybe_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
+                lora_metadata = maybe_lora_metadata
             else:
                 attn_metadata = self.attn_metadata
                 if self.enable_spec_decode:
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
+                lora_metadata = None
 
             inputs, gather_ids = self._prepare_inputs(
-                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
+                padded_requests, kv_cache_manager, attn_metadata, spec_metadata, lora_metadata,
                 new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
@@ -2200,6 +2307,16 @@ class PyTorchModelEngine(ModelEngine):
 
                     self.cuda_graph_runner.capture(batch_size,
                                                    capture_forward_fn, inputs)
+
+                    # TODO ZUKER: need to call _prepare_inputs after a full forward pass, and then capture, so the capture would contain the input tensors addresses
+                    print("ZUKER - PyTorchModelEngine.forward - After 1st capture, calling _prepare_inputs before re-capture")
+                    inputs, gather_ids = self._prepare_inputs(
+                        padded_requests, kv_cache_manager, attn_metadata, spec_metadata, lora_metadata,
+                        new_tensors_device, cache_indirection_buffer)
+                    print("ZUKER - PyTorchModelEngine.forward - After 1st capture, starting re-capture")
+                    self.cuda_graph_runner.capture(batch_size,
+                                                   capture_forward_fn, inputs)
+
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
@@ -2246,6 +2363,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
+        print("ZUKER - in _forward_step")
         logits = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None
@@ -2361,3 +2479,73 @@ class PyTorchModelEngine(ModelEngine):
                 lp(request.py_request_id, logits_row, token_ids, None, None)
 
             logits_tensor[idx] = logits_row.view(-1)
+
+    def init_lora_metadata(self) -> LoraMetadata:
+        lora_metadata: LoraMetadata = dict()
+        for name, module in self.model.named_modules():
+            if isinstance(module, LoraLayer):
+                print(f"ZUKER - init_lora_metadata - {name=}, {module.layer_idx=}, {module.output_hidden_sizes=}, {module.lora_module_types=}")
+                layer_lora_metadata = lora_metadata.get(module.layer_idx, None)
+                """if layer_lora_metadata is None:
+                    # Try to use the same metadata as the previous layer
+                    layer_lora_metadata = lora_metadata.get(module.layer_idx - 1, None)
+                    if layer_lora_metadata is not None:
+                        lora_metadata[module.layer_idx] = {}
+                        lora_metadata[module.layer_idx].update(layer_lora_metadata)
+                        workspace_size_in_bytes = 35*1024*1024
+                        workspace_metadata = {
+                            'workspace_tensor_host_splitk_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cpu").contiguous().pin_memory(),
+                            'workspace_tensor_device_splitk_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cuda").contiguous(),
+                            'workspace_tensor_host_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cpu").contiguous().pin_memory(),
+                            'workspace_tensor_device_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cuda").contiguous(),
+                        }
+                        layer_lora_metadata[tuple(module.output_hidden_sizes)].update(workspace_metadata)
+                        continue"""
+                if layer_lora_metadata is None:
+                    layer_lora_metadata = dict()
+                    lora_metadata[module.layer_idx] = layer_lora_metadata
+
+                # TODO ZUKER: Do we need to allocate the output tensor? how is it managed when using CUDA graphs? something needs to keep it statically allocated
+                output_tensors = [
+                    torch.zeros((self.max_num_tokens, module.output_hidden_sizes[i]),
+                                dtype=torch.float16,
+                                device="cuda")
+                    for i in range(len(module.output_hidden_sizes))
+                ]
+                output_tensors_ptrs = [
+                    t.data_ptr() for t in output_tensors
+                ]
+
+                # TODO ZUKER: Calculate max workspace size
+                # TODO ZUKER: Is it possible that two different modules with the same output_hidden_size would be executed
+                #             in parallel on two different streams? If so, different buffers would be required
+                #print(f"ZUKER - init_lora_metadata - {module.layer_idx=}, {module.output_hidden_sizes=}, {hex(workspace_device.data_ptr())=}, {[hex(p) for p in output_tensors_ptrs]=}")
+                workspace_size_in_bytes = 35*1024*1024
+                layer_lora_metadata[tuple(module.output_hidden_sizes)] = {
+                    'output_tensors': output_tensors,
+                    'output_tensors_ptrs': output_tensors_ptrs,
+                    'workspace_tensor_host_splitk_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cpu").contiguous().pin_memory(),
+                    'workspace_tensor_device_splitk_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cuda").contiguous(),
+                    'workspace_tensor_host_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cpu").contiguous().pin_memory(),
+                    'workspace_tensor_device_group_gemm': torch.zeros(workspace_size_in_bytes, dtype=torch.uint8, device="cuda").contiguous(),
+                }
+
+        return lora_metadata
+
+    def create_dummy_lora_task_layer_module_configs(self) -> list:
+        SELECTED_MODULE_TYPES = { 1, 2, 3 }  # ATTENTION_Q, ATTENTION_K, ATTENTION_V
+        MAX_RANK = 8  # TODO ZUKER: Set max rank here
+        task_layer_module_configs = []
+        for module in self.model.modules():
+            if isinstance(module, LoraLayer):
+                for module_idx in module.lora_module_types:
+                    if module_idx in SELECTED_MODULE_TYPES:
+                        module_config = tensorrt_llm.bindings.internal.runtime.TaskLayerModuleConfig()
+                        module_config.layer_id = module.layer_idx
+                        module_config.module_id = module_idx
+                        module_config.adapter_size = MAX_RANK
+                        module_config.weights_in_pointer = self.lora_weights_in_tensor.data_ptr()
+                        module_config.weights_out_pointer = self.lora_weights_out_tensor.data_ptr()
+                        task_layer_module_configs.append(module_config)
+
+        return task_layer_module_configs

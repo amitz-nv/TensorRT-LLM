@@ -30,7 +30,8 @@ class MLP(nn.Module):
         config = config or ModelConfig()
         self.up_lora = LoraLayer(
             [LoraModuleType.MLP_H_TO_4H],
-            [self.intermediate_size // config.mapping.tp_size])
+            [self.intermediate_size // config.mapping.tp_size],
+            self.layer_idx)
 
         self.up_proj = Linear(
             self.hidden_size,
@@ -48,7 +49,7 @@ class MLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization)
 
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
-                                   [self.hidden_size])
+                                   [self.hidden_size], self.layer_idx)
         self.down_proj = Linear(
             self.intermediate_size,
             self.hidden_size,
@@ -84,9 +85,7 @@ class MLP(nn.Module):
         assert lora_params is not None
 
         x_up = self.up_proj(x)
-
-        assert self.layer_idx is not None, "layer_idx is required for lora"
-        x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
+        x_up_lora = self.up_lora(x, lora_params)
         if x_up_lora is not None:
             x_up = x_up + x_up_lora
 

@@ -1644,7 +1644,7 @@ class Linear(nn.Module):
         output = self.quant_method.apply(self, input, bias)
 
         if self.lora is not None and bool(lora_params):
-            lora_result = self.lora(input, lora_params, layer_idx)
+            lora_result = self.lora(input, lora_params)
             if lora_result is not None:
                 output = output + lora_result
         return output

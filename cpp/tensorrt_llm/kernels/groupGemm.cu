@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include <stdexcept>
 
 namespace tensorrt_llm
 {
@@ -57,12 +58,64 @@ int64_t getGroupedGemmParamsWorkSpaceSize(int64_t problemCount)
     return gemm_coord_size + ptr_size + ldd_size;
 }
 
+template <typename cutlassType, int kAlignmentAB, int kAlignmentC>
+void prepareGroupedGemmWorkspace_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD, void* hostWorkspace)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    using ElementA = cutlassType;
+    using ElementB = cutlassType;
+    using ElementOutput = cutlassType;
+    using ElementAccumulator = float;
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+
+    int problemCount = problem_sizes.size();
+
+    auto gemm_coord_size = getGemmCoordSize(problemCount);
+    auto ptr_size = getPtrSize(problemCount);
+    auto ldd_size = getLddSize(problemCount);
+
+    cutlass::gemm::GemmCoord* problem_sizes_host = reinterpret_cast<cutlass::gemm::GemmCoord*>(hostWorkspace);
+    ElementA** ptr_A_host = reinterpret_cast<ElementA**>((char*)hostWorkspace + gemm_coord_size);
+    ElementB** ptr_B_host = reinterpret_cast<ElementB**>((char*)hostWorkspace + gemm_coord_size + ptr_size);
+    ElementOutput** ptr_C_host = reinterpret_cast<ElementOutput**>((char*)hostWorkspace + gemm_coord_size + 2 * ptr_size);
+    ElementOutput** ptr_D_host = reinterpret_cast<ElementOutput**>((char*)hostWorkspace + gemm_coord_size + 3 * ptr_size);
+    int64_t* lda_host = reinterpret_cast<int64_t*>((char*)hostWorkspace + gemm_coord_size + 4 * ptr_size + 0 * ldd_size);
+    int64_t* ldb_host = reinterpret_cast<int64_t*>((char*)hostWorkspace + gemm_coord_size + 4 * ptr_size + 1 * ldd_size);
+    int64_t* ldc_host = reinterpret_cast<int64_t*>((char*)hostWorkspace + gemm_coord_size + 4 * ptr_size + 2 * ldd_size);
+    int64_t* ldd_host = reinterpret_cast<int64_t*>((char*)hostWorkspace + gemm_coord_size + 4 * ptr_size + 3 * ldd_size);
+
+    for (int32_t i = 0; i < problemCount; ++i)
+    {
+        problem_sizes_host[i] = problem_sizes.at(i);
+        ptr_A_host[i] = (ElementA*) ptrA.at(i);
+        ptr_B_host[i] = (ElementB*) ptrB.at(i);
+        ptr_C_host[i] = (ElementOutput*) ptrC.at(i);
+        ptr_D_host[i] = (ElementOutput*) ptrD.at(i);
+
+        auto problem = problem_sizes.at(i);
+        lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
+        TLLM_CHECK(lda_host[i] % kAlignmentAB == 0);
+        ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
+        TLLM_CHECK(ldb_host[i] % kAlignmentAB == 0);
+        ldc_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
+        TLLM_CHECK(ldc_host[i] % kAlignmentC == 0);
+        ldd_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
+        TLLM_CHECK(ldd_host[i] % kAlignmentC == 0);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
     int kStages>
 void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    nvinfer1::DataType dataType, cudaStream_t stream)
+    nvinfer1::DataType dataType, cudaStream_t stream, void* hostWorkspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     using ElementA = cutlassType;
@@ -98,35 +151,23 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     auto ptr_size = getPtrSize(problemCount);
     auto ldd_size = getLddSize(problemCount);
 
-    char* host_workspace = (char*) std::malloc(gemmParamsWorkSpaceSize);
-    cutlass::gemm::GemmCoord* problem_sizes_host = reinterpret_cast<cutlass::gemm::GemmCoord*>(host_workspace);
-    ElementA** ptr_A_host = reinterpret_cast<ElementA**>(host_workspace + gemm_coord_size);
-    ElementB** ptr_B_host = reinterpret_cast<ElementB**>(host_workspace + gemm_coord_size + ptr_size);
-    ElementOutput** ptr_C_host = reinterpret_cast<ElementOutput**>(host_workspace + gemm_coord_size + 2 * ptr_size);
-    ElementOutput** ptr_D_host = reinterpret_cast<ElementOutput**>(host_workspace + gemm_coord_size + 3 * ptr_size);
-    int64_t* lda_host = reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 4 * ptr_size + 0 * ldd_size);
-    int64_t* ldb_host = reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 4 * ptr_size + 1 * ldd_size);
-    int64_t* ldc_host = reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 4 * ptr_size + 2 * ldd_size);
-    int64_t* ldd_host = reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 4 * ptr_size + 3 * ldd_size);
-
-    for (int32_t i = 0; i < problemCount; ++i)
+    TLLM_LOG_INFO("ZUKER - groupedGemm_ - gemmParamsWorkSpaceSize=%ld", gemmParamsWorkSpaceSize);
+    if (hostWorkspace == nullptr)
     {
-        problem_sizes_host[i] = problem_sizes.at(i);
-        ptr_A_host[i] = (ElementA*) ptrA.at(i);
-        ptr_B_host[i] = (ElementB*) ptrB.at(i);
-        ptr_C_host[i] = (ElementOutput*) ptrC.at(i);
-        ptr_D_host[i] = (ElementOutput*) ptrD.at(i);
-
-        auto problem = problem_sizes.at(i);
-        lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
-        TLLM_CHECK(lda_host[i] % kAlignmentAB == 0);
-        ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
-        TLLM_CHECK(ldb_host[i] % kAlignmentAB == 0);
-        ldc_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
-        TLLM_CHECK(ldc_host[i] % kAlignmentC == 0);
-        ldd_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
-        TLLM_CHECK(ldd_host[i] % kAlignmentC == 0);
+        // gemmParamsWorkSpaceSize Allocate as pinned memory to speed up the memcpy
+        TLLM_LOG_INFO("ZUKER - groupedGemm_ - Calling cudaMallocHost for hostWorkspace, size: %ld", gemmParamsWorkSpaceSize);
+        cudaError_t err = cudaMallocHost((void**) &hostWorkspace, gemmParamsWorkSpaceSize);
+        if (err != cudaSuccess)
+        {
+            // Handle error
+            TLLM_LOG_ERROR("cudaMallocHost failed in %s, err code: %d", __PRETTY_FUNCTION__, err);
+            throw std::bad_alloc();
+        }
     }
+    TLLM_LOG_INFO("ZUKER - groupedGemm_ - hostWorkspace=%p", hostWorkspace);
+
+    prepareGroupedGemmWorkspace_<cutlassType, kAlignmentAB, kAlignmentC>(
+        problem_sizes, ptrA, ptrB, ptrC, ptrD, hostWorkspace);
 
     cutlass::gemm::GemmCoord* problem_sizes_device = reinterpret_cast<cutlass::gemm::GemmCoord*>(gemmParamsWorkSpace);
     ElementA** ptr_A = reinterpret_cast<ElementA**>((char*) gemmParamsWorkSpace + gemm_coord_size);
@@ -144,9 +185,9 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     int64_t* ldd
         = reinterpret_cast<int64_t*>((char*) gemmParamsWorkSpace + gemm_coord_size + 4 * ptr_size + 3 * ldd_size);
 
-    TLLM_CHECK(((char*) ldc_host - (char*) host_workspace) == ((char*) ldc - (char*) gemmParamsWorkSpace));
+    TLLM_LOG_INFO("ZUKER - groupedGemm_ - calling cudaAutoCpy(tgt=%p, src=%p, size=%ld), stream=%p", gemmParamsWorkSpace, hostWorkspace, gemmParamsWorkSpaceSize, stream);
     tensorrt_llm::common::cudaAutoCpy(
-        (int8_t*) gemmParamsWorkSpace, (int8_t*) host_workspace, gemmParamsWorkSpaceSize, stream);
+        (int8_t*) gemmParamsWorkSpace, (int8_t*) hostWorkspace, gemmParamsWorkSpaceSize, stream);
 
     int threadblock_count = Gemm::sufficient(problem_sizes.data(), problemCount);
 
@@ -169,21 +210,21 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to run CUTLASS Grouped GEMM kernel.");
     sync_check_cuda_error(stream);
 
-    std::free(host_workspace);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
+
 
 template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
 void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    nvinfer1::DataType dataType, cudaStream_t stream)
+    nvinfer1::DataType dataType, cudaStream_t stream, void* hostWorkspace)
 {
     if (dataType == nvinfer1::DataType::kHALF)
     {
         groupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(problem_sizes, ptrA,
             ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType,
-            stream);
+            stream, hostWorkspace);
     }
     else if (dataType == nvinfer1::DataType::kFLOAT)
     {
@@ -194,7 +235,30 @@ void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::
     {
         groupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC, kStages>(problem_sizes,
             ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize,
-            dataType, stream);
+            dataType, stream, hostWorkspace);
+    }
+#endif
+}
+
+template <int kAlignmentAB, int kAlignmentC>
+void prepareGroupedGemmTypeWorkspace_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
+    nvinfer1::DataType dataType, void* hostWorkspace)
+{
+    if (dataType == nvinfer1::DataType::kHALF)
+    {
+        prepareGroupedGemmWorkspace_<cutlass::half_t, kAlignmentAB, kAlignmentC>(problem_sizes, ptrA,
+            ptrB, ptrC, ptrD, hostWorkspace);
+    }
+    else if (dataType == nvinfer1::DataType::kFLOAT)
+    {
+        TLLM_CHECK_WITH_INFO(false, "not support float input/output");
+    }
+#ifdef ENABLE_BF16
+    else if (dataType == nvinfer1::DataType::kBF16)
+    {
+        prepareGroupedGemmWorkspace_<cutlass::bfloat16_t, kAlignmentAB, kAlignmentC>(problem_sizes,
+            ptrA, ptrB, ptrC, ptrD, hostWorkspace);
     }
 #endif
 }
@@ -202,7 +266,7 @@ void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::
 void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream)
+    bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream, void* hostWorkspace)
 {
     TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
     if (isLoraIn)
@@ -212,22 +276,22 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
         if (minKN >= 8)
         {
             groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
         }
         else if (minKN >= 4)
         {
             groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 4, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
         }
         else if (minKN >= 2)
         {
             groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 2, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
         }
         else if (minKN >= 1)
         {
             groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
         }
     }
     else
@@ -237,22 +301,71 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
         if (minKN >= 8)
         {
             groupedGemmType_<32, 128, 32, 32, 32, 32, 8, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
         }
         else if (minKN >= 4)
         {
             groupedGemmType_<32, 128, 32, 32, 32, 32, 4, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
         }
         else if (minKN >= 2)
         {
             groupedGemmType_<32, 128, 32, 32, 32, 32, 2, 8, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
         }
         else
         {
             groupedGemmType_<32, 128, 32, 32, 32, 32, 1, 8, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
-                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream, hostWorkspace);
+        }
+    }
+}
+
+void prepareGroupedGemmWorkspace(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD, bool isLoraIn,
+    nvinfer1::DataType dataType, int minKN, void* hostWorkspace)
+{
+    TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
+    if (isLoraIn)
+    {
+        // K >> N, like K = 1024, N = 8
+        // Use larger K tile and smaller N tile
+        if (minKN >= 8)
+        {
+            prepareGroupedGemmTypeWorkspace_<8, 8>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
+        }
+        else if (minKN >= 4)
+        {
+            prepareGroupedGemmTypeWorkspace_<8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
+        }
+        else if (minKN >= 2)
+        {
+            prepareGroupedGemmTypeWorkspace_<8, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
+        }
+        else if (minKN >= 1)
+        {
+            prepareGroupedGemmTypeWorkspace_<8, 1>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
+        }
+    }
+    else
+    {
+        // N >> K, like K = 8, N = 1024
+        // User larger N tile and smaller K tile
+        if (minKN >= 8)
+        {
+            prepareGroupedGemmTypeWorkspace_<8, 8>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
+        }
+        else if (minKN >= 4)
+        {
+            prepareGroupedGemmTypeWorkspace_<4, 8>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
+        }
+        else if (minKN >= 2)
+        {
+            prepareGroupedGemmTypeWorkspace_<2, 8>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
+        }
+        else
+        {
+            prepareGroupedGemmTypeWorkspace_<1, 8>(problem_sizes, ptrA, ptrB, ptrC, ptrD, dataType, hostWorkspace);
         }
     }
 }

@@ -27,6 +27,10 @@ int64_t getSplitkGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
 void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkspace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream);
+    bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream, void* hostWorkspace);
+
+void prepareSplitkGroupedGemmWorkspace(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
+    bool isLoraIn, nvinfer1::DataType dataType, int minKN, void* hostWorkspace);
 
 } // namespace tensorrt_llm::kernels

@@ -39,7 +39,13 @@ public:
     [[nodiscard]] size_t getWorkspaceSize(int64_t numTokens, int64_t numReqs, nvinfer1::DataType type) const noexcept;
     void setBestTactic(std::optional<Config> config);
     int run(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
-        void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream);
+        void const* const* loraWeightsPtr, int weightIndex, void* const* outputs,
+        void* deviceWorkspaceSplitKGroupedGemm, void* hostWorkspaceSplitKGroupedGemm, void* deviceWorkspaceGroupedGemm,
+        void* hostWorkspaceGroupedGemm, cudaStream_t stream);
+
+    int prepareLoraWorkspaces(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+        void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* deviceWorkspaceSplitKGroupedGemm,
+        void* hostWorkspaceSplitKGroupedGemm, void* deviceWorkspaceGroupedGemm, void* hostWorkspaceGroupedGemm);
 
     void setGemmConfig();
 

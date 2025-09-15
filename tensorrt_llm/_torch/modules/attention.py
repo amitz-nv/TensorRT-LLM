@@ -217,7 +217,8 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization)
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
-                                [self.hidden_size])
+                                [self.hidden_size],
+                                self.layer_idx)
 
         self.o_proj = Linear(
             tp_size * self.q_size,
@@ -242,12 +243,12 @@ class Attention(nn.Module):
         self.splitted_qkv_lora = LoraLayer([
             LoraModuleType.ATTENTION_Q, LoraModuleType.ATTENTION_K,
             LoraModuleType.ATTENTION_V
-        ], [self.q_size, self.kv_size, self.kv_size])
+        ], [self.q_size, self.kv_size, self.kv_size], self.layer_idx)
         self.fused_qkv_lora = LoraLayer([LoraModuleType.ATTENTION_QKV],
-                                        [self.q_size + 2 * self.kv_size])
+                                        [self.q_size + 2 * self.kv_size], self.layer_idx)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
-                                [self.hidden_size])
+                                [self.hidden_size], self.layer_idx)
 
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
@@ -482,15 +483,17 @@ class Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
 
         if bool(lora_params):
-            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
-                                              self.layer_idx)
+            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params)
             if qkv_lora is not None:
+                print(f"ZUKER - Attention.forward - after splitted_qkv_lora - {qkv_lora.shape=}")
                 qkv = qkv + qkv_lora
+            print(f"ZUKER - Attention.forward - after splitted_qkv_lora - {qkv.shape=}")
 
-            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
-                                           self.layer_idx)
+            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params)
             if qkv_lora is not None:
+                print(f"ZUKER - Attention.forward - after fused_qkv_lora - {qkv_lora.shape=}")
                 qkv = qkv + qkv_lora
+            print(f"ZUKER - Attention.forward - after fused_qkv_lora - {qkv.shape=}")
 
         q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)

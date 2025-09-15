@@ -272,7 +272,11 @@ void cudaAutoCpy(T* tgt, T const* src, const size_t size, cudaStream_t stream)
     }
     else
     {
-        check_cuda_error(cudaMemcpy(tgt, src, sizeof(T) * size, cudaMemcpyDefault));
+        cudaError_t err = cudaMemcpy(tgt, src, sizeof(T) * size, cudaMemcpyDefault);
+        if (err != cudaSuccess) {
+            TLLM_LOG_INFO("ZUKER - cudaAutoCpy - err=%d, err string=%s", err, cudaGetErrorString(err));
+        }
+        check_cuda_error(err);
     }
 }
 

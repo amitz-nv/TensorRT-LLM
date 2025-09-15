@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/selectiveScan/selectiveScan.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <new>
 
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
@@ -53,7 +54,8 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     std::vector<th::Tensor> const& lora_weights_pointers, th::Tensor const& host_context_lengths,
     std::vector<int64_t> const& output_hidden_sizes, bool transA, bool transB, int64_t const max_low_rank,
     int64_t const& weight_index, bool isRemoveInputPadding, std::optional<std::vector<int64_t>> const& output_ptrs,
-    std::optional<th::Tensor> const& workspace_tensor)
+    std::optional<th::Tensor> device_workspace_gemm1, std::optional<th::Tensor> host_workspace_gemm1,
+    std::optional<th::Tensor> device_workspace_gemm2, std::optional<th::Tensor> host_workspace_gemm2)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -168,15 +170,108 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
 
     void* const* outputsPtr = output_ptrs.has_value() ? reinterpret_cast<void* const*>(output_ptrs.value().data())
                                                       : reinterpret_cast<void* const*>(output.data());
-    void* workspacePtr = workspace_tensor.has_value() ? workspace_tensor.value().data_ptr() : workspace.data_ptr();
 
-    TLLM_LOG_INFO("ZUKER - lora_grouped_gemm - outputsPtr=%p, workspacePtr=%p", outputsPtr, workspacePtr);
+    void* deviceWorkspaceGemm1 = device_workspace_gemm1.has_value() ? device_workspace_gemm1.value().data_ptr() : workspace.data_ptr();
+    void* hostWorkspaceGemm1 = host_workspace_gemm1.has_value() ? host_workspace_gemm1.value().data_ptr() : nullptr;
+    void* deviceWorkspaceGemm2 = device_workspace_gemm2.has_value() ? device_workspace_gemm2.value().data_ptr() : workspace.data_ptr();
+    void* hostWorkspaceGemm2 = host_workspace_gemm2.has_value() ? host_workspace_gemm2.value().data_ptr() : nullptr;
+
+    TLLM_LOG_INFO("ZUKER - lora_grouped_gemm - outputsPtr=%p, deviceWorkspaceGemm1=%p, hostWorkspaceGemm1=%p, deviceWorkspaceGemm2=%p, hostWorkspaceGemm2=%p",
+        outputsPtr, deviceWorkspaceGemm1, hostWorkspaceGemm1, deviceWorkspaceGemm2, hostWorkspaceGemm2);
     mLoraImpl->run(numTokens, numReqs, input.data_ptr(), expandLoraRanks.data(), expandLoraWeightPtrs.data(),
-        weight_index, outputsPtr, workspacePtr, stream);
+        weight_index, outputsPtr, deviceWorkspaceGemm1, hostWorkspaceGemm1, deviceWorkspaceGemm2, hostWorkspaceGemm2,
+        stream);
     sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return output_torch;
+}
+
+int64_t prepare_lora_gemms_workspace(th::Tensor input, int64_t max_seq_len, int64_t max_num_tokens, th::Tensor const& host_request_types,
+    std::vector<th::Tensor> const& lora_ranks, // numModules tensors, each tensors has single value
+    std::vector<th::Tensor> const& lora_weights_pointers, th::Tensor const& host_context_lengths,
+    std::vector<int64_t> const& output_hidden_sizes, bool transA, bool transB, int64_t const max_low_rank,
+    int64_t const& weight_index, bool isRemoveInputPadding, std::vector<int64_t> const& output_ptrs,
+    th::Tensor device_workspace_gemm1, th::Tensor host_workspace_gemm1,
+    th::Tensor device_workspace_gemm2, th::Tensor host_workspace_gemm2)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const numReqs = lora_ranks[0].sizes()[0];
+    int const numLoraModules = lora_ranks.size();
+    TLLM_CHECK_WITH_INFO(lora_ranks.size() == lora_weights_pointers.size(), "both should be numLoraModules");
+
+    int const seqLen = isRemoveInputPadding ? 0 : input.sizes()[1];
+    int32_t const* reqTypes = static_cast<int32_t const*>(host_request_types.data_ptr());
+    int32_t const* hostContextLengths
+        = isRemoveInputPadding ? static_cast<int32_t const*>(host_context_lengths.data_ptr()) : nullptr;
+
+    int64_t numTokens = max_num_tokens; //getNumTokens(input);
+
+    std::vector<void const*> expandLoraWeightPtrs{};
+    std::vector<int32_t> expandLoraRanks{};
+
+    expandLoraRanks.reserve(numLoraModules * numTokens);
+    expandLoraWeightPtrs.reserve(numLoraModules * numTokens * 2);
+
+    for (int loraModuleIdx = 0; loraModuleIdx < numLoraModules; loraModuleIdx++)
+    {
+        auto const loraRankModule = static_cast<int32_t const*>(lora_ranks[loraModuleIdx].data_ptr());
+        auto const loraWeightModulePtrs = static_cast<int64_t const*>(lora_weights_pointers[loraModuleIdx].data_ptr());
+
+        int idx = 0;
+        for (int reqId = 0; reqId < numReqs; reqId++)
+        {
+            // loraWeightModulePtrs has 3 pointers for each module: A,B, and an optional DoRA magnitude
+            // the current LoRA plugin does not apply DoRA scaling, so the magnitude is ignored
+            RequestType const reqType = static_cast<RequestType const>(reqTypes[reqId]);
+            if (reqType == RequestType::kGENERATION)
+            {
+                expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
+                expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3 + 1]));
+                expandLoraRanks.push_back(loraRankModule[reqId]);
+                idx += 1;
+            }
+            else
+            {
+                int contextLen = (isRemoveInputPadding ? hostContextLengths[reqId] : seqLen);
+                for (int contextId = 0; contextId < contextLen; contextId++)
+                {
+                    expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
+                    expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3 + 1]));
+                    expandLoraRanks.push_back(loraRankModule[reqId]);
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    int const inHiddenSize = input.sizes()[input.sizes().size() - 1];
+    
+    std::vector<int> outHiddenSizes(output_hidden_sizes.size());
+    for (int i = 0; i < numLoraModules; i++)
+    {
+        outHiddenSizes[i] = output_hidden_sizes[i];
+    }
+    nvinfer1::DataType loraRuntimeDataType;
+    switch (input.scalar_type())
+    {
+        case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
+        case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
+        default: throw std::invalid_argument("Invalid dtype, only supports float16, bfloat16");
+    }
+    
+    std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> cublasWrapper;
+    auto mLoraImpl = std::make_shared<tensorrt_llm::kernels::LoraImpl>(
+        inHiddenSize, outHiddenSizes, transA, transB, numLoraModules, loraRuntimeDataType, max_low_rank, cublasWrapper);
+
+    //TLLM_LOG_INFO("ZUKER - prepare_lora_gemms_workspace - calling mLoraImpl->prepareLoraWorkspaces numTokens=%ld, numReqs=%ld", numTokens, numReqs);
+    TLLM_LOG_INFO("ZUKER - prepare_log_gemms_workspace - host_workspace_gemm1.data_ptr()=%p", host_workspace_gemm1.data_ptr());
+    mLoraImpl->prepareLoraWorkspaces(numTokens, numReqs, input.data_ptr(), expandLoraRanks.data(), expandLoraWeightPtrs.data(),
+        weight_index, reinterpret_cast<void* const*>(output_ptrs.data()), device_workspace_gemm1.data_ptr(),
+        host_workspace_gemm1.data_ptr(), device_workspace_gemm2.data_ptr(), host_workspace_gemm2.data_ptr());
+    TLLM_LOG_TRACE("%s end", __PRETTY_FUNCTION__);
+    return 0;
 }
 
 } // namespace torch_ext
@@ -196,11 +291,36 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int weight_index, "
         "bool isRemoveInputPadding, "
         "int []? output_ptrs, "
-        "Tensor? workspace_tensor"
+        "Tensor? device_workspace_gemm1, "
+        "Tensor? host_workspace_gemm1, "
+        "Tensor? device_workspace_gemm2, "
+        "Tensor? host_workspace_gemm2"
         ") -> Tensor[]");
+
+    m.def(
+        "prepare_lora_gemms_workspace(Tensor input, "
+        "int max_seq_len, "
+        "int max_num_tokens, "
+        "Tensor host_request_types, "
+        "Tensor [] lora_ranks, "
+        "Tensor [] lora_weights_pointers, "
+        "Tensor host_context_lengths, "
+        "int [] output_hidden_sizes, "
+        "bool transA, "
+        "bool transB, "
+        "int max_low_rank, "
+        "int weight_index, "
+        "bool isRemoveInputPadding, "
+        "int [] output_ptrs, "
+        "Tensor device_workspace_gemm1, "
+        "Tensor host_workspace_gemm1, "
+        "Tensor device_workspace_gemm2, "
+        "Tensor host_workspace_gemm2"
+        ") -> int");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("lora_grouped_gemm", &torch_ext::lora_grouped_gemm);
+    m.impl("prepare_lora_gemms_workspace", &torch_ext::prepare_lora_gemms_workspace);
 }

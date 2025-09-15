@@ -464,7 +464,8 @@ public:
 
             if (result != cudaSuccess)
             {
-                CUTLASS_TRACE_HOST("  grid launch failed with error " << cudaGetErrorString(result));
+                std::cout << __FILE__ << ":" << __LINE__ << "  " << "  grid launch failed with error " << cudaGetErrorString(result) << std::endl;
+                //CUTLASS_TRACE_HOST("  grid launch failed with error " << cudaGetErrorString(result));
                 return Status::kErrorInternal;
             }
         }
@@ -473,6 +474,7 @@ public:
         {
             dim3 grid(32, gemm_params_.problem_visitor.problem_count);
             dim3 block(256);
+            std::cout << __FILE__ << ":" << __LINE__ << "  " << "  Launching kernel splitkReduction, problem_sizes=" << gemm_params_.problem_visitor.problem_sizes << ", problem_count=" << gemm_params_.problem_visitor.problem_count << std::endl;
             splitkReduction<<<grid, block, 0, stream>>>(gemm_params_.ptr_D, gemm_params_.ptr_D_split,
                 gemm_params_.problem_visitor.problem_sizes, gemm_params_.split_k_slices,
                 gemm_params_.splitk_buffer_offsets);
@@ -481,7 +483,8 @@ public:
 
             if (result != cudaSuccess)
             {
-                CUTLASS_TRACE_HOST("  grid launch failed with error " << cudaGetErrorString(result));
+                std::cout << __FILE__ << ":" << __LINE__ << "  " << "  splitkReduction grid launch failed with error " << cudaGetErrorString(result) << std::endl;
+                //CUTLASS_TRACE_HOST("  grid launch failed with error " << cudaGetErrorString(result));
                 return Status::kErrorInternal;
             }
         }

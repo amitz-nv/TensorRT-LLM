@@ -69,7 +69,7 @@ class GatedMLP(nn.Module):
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm)
 
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
-                                   [self.hidden_size])
+                                   [self.hidden_size], self.layer_idx)
 
         self.down_proj = Linear(
             self.intermediate_size,
@@ -93,10 +93,10 @@ class GatedMLP(nn.Module):
             [LoraModuleType.MLP_H_TO_4H, LoraModuleType.MLP_GATE], [
                 self.intermediate_size // mapping.tp_size,
                 self.intermediate_size // mapping.tp_size
-            ])
+            ], self.layer_idx)
         self.fused_gate_up_lora = LoraLayer(
             [LoraModuleType.MLP_GATE_UP],
-            [2 * self.intermediate_size // mapping.tp_size])
+            [2 * self.intermediate_size // mapping.tp_size], self.layer_idx)
 
     def _apply_activation(self, x):
         if self.activation == F.silu:
@@ -146,12 +146,12 @@ class GatedMLP(nn.Module):
 
         h1 = self.gate_up_proj(x)
 
-        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
+        h1_lora = self.splitted_gate_up_lora(x, lora_params)
 
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
+        h1_lora = self.fused_gate_up_lora(x, lora_params)
         if h1_lora is not None:
             h1 = h1 + h1_lora
 

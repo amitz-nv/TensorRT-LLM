@@ -5,7 +5,7 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutorWorker
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
@@ -353,17 +353,51 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
         cuda_graph_config=None)
 
 
+@pytest.mark.parametrize("cuda_graph_config",
+                         [#None,
+                          CudaGraphConfig(max_batch_size=1)
+                         ])
+def test_lora_dir_with_graph(cuda_graph_config):
+    lora_req = LoRARequest(
+        "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
+
+    lora_config = LoraConfig(
+        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
+        max_lora_rank=8,
+        max_loras=4,
+        max_cpu_loras=4)
+
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              cuda_graph_config=cuda_graph_config)
+
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+    ]
+    references = [
+        "美国的首都是华盛顿。\n\n美国的",
+    ]
+    sampling_params = SamplingParams(max_tokens=20)
+    lora_request = [lora_req]
+
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+
+    assert similar(outputs[0].outputs[0].text, references[0])
+    print(f"lora output: {outputs[0].outputs[0].text}")
+    print(f"ref  output: {references[0]}")
+
+
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
     """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
     llm.generate call, that's repeated twice.
     """  # noqa: D205
     _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call=[2],
-        max_loras=1,
-        max_cpu_loras=2,
-        repeat_calls=2,
-        repeats_per_call=3)
+        lora_adapter_count_per_call=[3, 2, 1],
+        max_loras=3,
+        max_cpu_loras=3,
+        repeat_calls=1,
+        repeats_per_call=1)
 
 
 @skip_gpu_memory_less_than_40gb

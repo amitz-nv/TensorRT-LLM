@@ -133,8 +133,132 @@ void LoraImpl::setBestTactic(std::optional<Config> config)
     mBestConfig = config;
 }
 
+int LoraImpl::prepareLoraWorkspaces(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* deviceWorkspaceSplitKGroupedGemm,
+    void* hostWorkspaceSplitKGroupedGemm, void* deviceWorkspaceGroupedGemm, void* hostWorkspaceGroupedGemm)
+{
+   TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    // inputs
+    //     numTokens
+    //     numReqs
+    //     input [numTokens, K] (view as 2D)
+    //     loraRanks [mNumLoraModules, numTokens] on cpu
+    //     loraWeightsPtr [mNumLoraModules, numTokens, 2] on cpu
+    // outputs
+    //     output [-1, N] (view as 2D)
+    //     ... (there are mNumLoraModules outputs)
+
+    // workspace shape: [gemmWorkSpace, lowrankWorkSpace, groupGemmParamsWorkSpace]
+    if (numTokens == 0)
+    {
+        return 0;
+    }
+    auto const typeSize = tensorrt_llm::runtime::BufferDataType(mType).getSize();
+
+    int64_t GemmWorkSpaceSize = getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices);
+    int64_t groupGemmParamsWorkSpaceSize = getGemmParamsWorkSpaceSize(std::min(numReqs, numTokens) * mNumLoraModules);
+    void* lowRankWorkSpace = static_cast<char*>(deviceWorkspaceSplitKGroupedGemm) + GemmWorkSpaceSize;
+    void* groupGemmParamsWorkSpace = static_cast<char*>(lowRankWorkSpace)
+        + getLowRankWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, typeSize);
+    
+    std::vector<cutlass::gemm::GemmCoord> problem_sizes;
+    problem_sizes.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrA;
+    ptrA.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrB;
+    ptrB.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrC;
+    ptrC.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrD;
+    ptrD.reserve(numTokens * mNumLoraModules);
+
+    std::vector<cutlass::gemm::GemmCoord> problem_sizes_2;
+    problem_sizes_2.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrA_2;
+    ptrA_2.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrB_2;
+    ptrB_2.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrC_2;
+    ptrC_2.reserve(numTokens * mNumLoraModules);
+    std::vector<void*> ptrD_2;
+    ptrD_2.reserve(numTokens * mNumLoraModules);
+
+    int minKN = mInHiddenSize; // Used to determine the alignment size
+    for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
+    {
+        auto const* loraWeightsPtrModule
+            = reinterpret_cast<int64_t const*>(&loraWeightsPtr[loraModuleIdx * numTokens * 2]);
+        int32_t const* loraRanksModule = &loraRanks[loraModuleIdx * numTokens];
+
+        // The following loop aggregates the contiguous requests that use the same LoRA weights to reduce
+        // the problem_size of grouped GEMMs and increase the M dimension of those GEMMs.
+        int rowId = 0;
+        int handled_token_num = 0;
+        while (rowId < numTokens)
+        {
+            auto const lora_rank = loraRanksModule[rowId];
+            auto const N = lora_rank;
+            int count = 0;
+            size_t M = 0;
+            while (rowId + count < numTokens && lora_rank == loraRanksModule[rowId + count]
+                && loraWeightsPtrModule[rowId * 2] == loraWeightsPtrModule[(rowId + count) * 2]
+                && loraWeightsPtrModule[rowId * 2 + 1] == loraWeightsPtrModule[(rowId + count) * 2 + 1])
+            {
+                M += 1;
+                count++;
+            }
+
+            if (N > 0)
+            {
+                TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
+
+                    "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank);
+
+                auto const K = mInHiddenSize;
+                minKN = std::min(minKN, N);
+                minKN = std::min(minKN, K);
+
+                cutlass::gemm::GemmCoord problem(M, N, K);
+                problem_sizes.push_back(problem);
+
+                ptrA.push_back(static_cast<void*>(
+                    static_cast<char*>(const_cast<void*>(input)) + handled_token_num * K * typeSize));
+                ptrB.push_back(
+                    reinterpret_cast<void*>(loraWeightsPtrModule[rowId * 2] + K * N * typeSize * weightIndex));
+                ptrC.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
+                    + (loraModuleIdx * numTokens * mMaxLowRank + handled_token_num * mMaxLowRank) * typeSize));
+                ptrD.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
+                    + (loraModuleIdx * numTokens * mMaxLowRank + handled_token_num * mMaxLowRank) * typeSize));
+
+                auto const N2 = mOutHiddenSizes[loraModuleIdx];
+                cutlass::gemm::GemmCoord problem_2(M, N2, N);
+                problem_sizes_2.push_back(problem_2);
+                ptrA_2.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
+                    + (loraModuleIdx * numTokens * mMaxLowRank + handled_token_num * mMaxLowRank) * typeSize));
+                ptrB_2.push_back(
+                    reinterpret_cast<void*>(loraWeightsPtrModule[rowId * 2 + 1] + N2 * N * typeSize * weightIndex));
+                ptrC_2.push_back(static_cast<void*>(
+                    static_cast<char*>(outputs[loraModuleIdx]) + handled_token_num * N2 * typeSize));
+                ptrD_2.push_back(static_cast<void*>(
+                    static_cast<char*>(outputs[loraModuleIdx]) + handled_token_num * N2 * typeSize));
+                //TLLM_LOG_INFO("ZUKER - LoraImpl::prepareLoraWorkspaces - outputs[%d]=%p", loraModuleIdx, outputs[loraModuleIdx]);
+            }
+            handled_token_num += M;
+            rowId += count;
+        }
+        TLLM_CHECK(handled_token_num == numTokens);
+    }
+
+    prepareSplitkGroupedGemmWorkspace(problem_sizes, ptrA, ptrB, ptrC, ptrD, true, mType, minKN,
+        hostWorkspaceSplitKGroupedGemm);
+    prepareGroupedGemmWorkspace(problem_sizes, ptrA, ptrB, ptrC, ptrD, true, mType, minKN, hostWorkspaceGroupedGemm);
+
+    return 0;
+}
+
 int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
-    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream)
+    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* deviceWorkspaceSplitKGroupedGemm,
+    void* hostWorkspaceSplitKGroupedGemm, void* deviceWorkspaceGroupedGemm, void* hostWorkspaceGroupedGemm, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // inputs
@@ -151,20 +275,26 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
     {
         return 0;
     }
-
+    TLLM_LOG_INFO("ZUKER - LoraImpl::run - numTokens=%ld, mNumLoraModules=%d", numTokens, mNumLoraModules);
     auto const typeSize = tensorrt_llm::runtime::BufferDataType(mType).getSize();
     setGemmConfig();
 
     int64_t GemmWorkSpaceSize = getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices);
     int64_t groupGemmParamsWorkSpaceSize = getGemmParamsWorkSpaceSize(std::min(numReqs, numTokens) * mNumLoraModules);
-    void* gemmWorkSpace = workspace; // [gemmWorkSpace, lowrankWorkSpace, groupGemmParamsWorkSpace]
+    void* gemmWorkSpace = deviceWorkspaceSplitKGroupedGemm; // [gemmWorkSpace, lowrankWorkSpace, groupGemmParamsWorkSpace]
     void* lowRankWorkSpace = static_cast<char*>(gemmWorkSpace) + GemmWorkSpaceSize;
+    void* lowRankWorkSpace2 = static_cast<char*>(deviceWorkspaceGroupedGemm) + GemmWorkSpaceSize;
     void* groupGemmParamsWorkSpace = static_cast<char*>(lowRankWorkSpace)
         + getLowRankWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, typeSize);
+    void* groupGemmParamsWorkSpace2 = static_cast<char*>(lowRankWorkSpace2)
+        + getLowRankWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, typeSize);
+    TLLM_LOG_INFO("ZUKER - LoraImpl::run - GemmWorkSpaceSize=%ld, deviceWorkspaceSplitKGroupedGemm=%p, lowRankWorkSpace=%p, groupGemmParamsWorkSpace=%p", GemmWorkSpaceSize, deviceWorkspaceSplitKGroupedGemm, lowRankWorkSpace, groupGemmParamsWorkSpace);
+    TLLM_LOG_INFO("ZUKER - LoraImpl::run - deviceWorkspaceGroupedGemm=%p, lowRankWorkSpace2=%p, groupGemmParamsWorkSpace2=%p", deviceWorkspaceGroupedGemm, lowRankWorkSpace2, groupGemmParamsWorkSpace2);
 
     for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
     {
         size_t size = numTokens * mOutHiddenSizes[loraModuleIdx];
+        TLLM_LOG_INFO("ZUKER - LoraImpl::run - cudaMemsetAsync(outputs[%d]=%p, 0, %ld)", loraModuleIdx, outputs[loraModuleIdx], size * typeSize);
         cudaMemsetAsync(outputs[loraModuleIdx], 0, size * typeSize, stream);
     }
 
@@ -190,6 +320,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
     // TODO can add batch_size == 1 case
     if (useUnifiedGemm)
     {
+        TLLM_LOG_INFO("ZUKER - LoraImpl::run - useUnifiedGemm=TRUE");
         for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
         {
             auto const* loraWeightsPtrModule
@@ -227,6 +358,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
     }
     else
     {
+        TLLM_LOG_INFO("ZUKER - LoraImpl::run - useUnifiedGemm=FALSE");
         std::vector<cutlass::gemm::GemmCoord> problem_sizes;
         problem_sizes.reserve(numTokens * mNumLoraModules);
         std::vector<void*> ptrA;
@@ -307,6 +439,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
                         static_cast<char*>(outputs[loraModuleIdx]) + handled_token_num * N2 * typeSize));
                     ptrD_2.push_back(static_cast<void*>(
                         static_cast<char*>(outputs[loraModuleIdx]) + handled_token_num * N2 * typeSize));
+                    TLLM_LOG_INFO("ZUKER - LoraImpl::run - outputs[%d]=%p", loraModuleIdx, outputs[loraModuleIdx]);
                 }
                 handled_token_num += M;
                 rowId += count;
@@ -322,10 +455,11 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
             // To improve the GPU utilization, we use splitK to handle the K dimension in multiple blocks in parallel.
             splitkGroupedGemm(problem_sizes, ptrA, ptrB, ptrC, ptrD, groupGemmParamsWorkSpace,
                 groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, true, mType, mSplitKSlices, minKN,
-                stream);
+                stream, hostWorkspaceSplitKGroupedGemm);
             sync_check_cuda_error(stream);
-            groupedGemm(problem_sizes_2, ptrA_2, ptrB_2, ptrC_2, ptrD_2, groupGemmParamsWorkSpace,
-                groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, false, mType, minKN, stream);
+            groupedGemm(problem_sizes_2, ptrA_2, ptrB_2, ptrC_2, ptrD_2, groupGemmParamsWorkSpace2,
+                groupGemmParamsWorkSpaceSize, deviceWorkspaceGroupedGemm, GemmWorkSpaceSize, false, mType, minKN,
+                stream, hostWorkspaceGroupedGemm);
             sync_check_cuda_error(stream);
         }
     }
@@ -337,7 +471,7 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
     void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(impl != nullptr, "Attempt to run an empty LoraImpl");
-    return impl->run(numTokens, numReqs, input, loraRanks, loraWeightsPtr, weightIndex, outputs, workspace, stream);
+    return impl->run(numTokens, numReqs, input, loraRanks, loraWeightsPtr, weightIndex, outputs, workspace, nullptr, workspace, nullptr, stream);
 }
 
 } // namespace tensorrt_llm::kernels

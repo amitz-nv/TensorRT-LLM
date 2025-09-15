@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import copy
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
@@ -53,6 +54,10 @@ class CUDAGraphRunner:
         return self._get_engine().is_spec_decode
 
     @property
+    def is_lora_enabled(self):
+        return self._get_engine().is_lora_enabled
+
+    @property
     def draft_len(self):
         return self.spec_config.max_draft_len if self.enable_spec_decode else 0
 
@@ -87,13 +92,14 @@ class CUDAGraphRunner:
         - A boolean indicating if a graph can be used.
         - The attn_metadata for the graph, if applicable.
         - The spec_metadata for the graph, if applicable.
+        - The lora_metadata for the graph, if applicable.
         """
         engine = self._get_engine()
 
         # disable when doing statistic
         if hasattr(engine, 'iter_counter') and ExpertStatistic.set_iter(
                 engine.iter_counter):
-            return False, None, None
+            return False, None, None, None
 
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
@@ -107,18 +113,18 @@ class CUDAGraphRunner:
                 for all_gen_only in all_can_graph_batch)
 
             if not is_all_gen_only or not all_batch_size_equal:
-                return False, None, None
+                return False, None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
-            return False, None, None
+            return False, None, None, None
 
         key = (batch_size, self.draft_len)
         if key in self.graphs:
             return True, self.graph_metadata[key][
-                "attn_metadata"], self.graph_metadata[key]["spec_metadata"]
+                "attn_metadata"], self.graph_metadata[key]["spec_metadata"], self.graph_metadata[key]["lora_metadata"]
 
         if batch_size not in self.supported_batch_sizes:
-            return False, None, None
+            return False, None, None, None
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
@@ -131,7 +137,14 @@ class CUDAGraphRunner:
             spec_metadata.draft_tokens = self.draft_tokens_cuda
         else:
             spec_metadata = None
-        return True, attn_metadata, spec_metadata
+
+        if self.is_lora_enabled:
+            lora_metadata = engine.init_lora_metadata()
+        else:
+            lora_metadata = None
+        print(f"ZUKER - CUDAGraphRunner.maybe_get_cuda_graph - {(lora_metadata is not None)=}")
+
+        return True, attn_metadata, spec_metadata, lora_metadata
 
     def needs_capture(self, batch_size: int):
         return (batch_size, self.draft_len) not in self.graph_outputs
@@ -168,9 +181,11 @@ class CUDAGraphRunner:
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(static_tensors)
 
+        print(f"ZUKER - CudaGraphRunner.capture - {key=}, {batch_size=}, {initial_inputs.get("lora_metadata", None) is not None=}")
         self.graph_metadata[key] = {
             "attn_metadata": initial_inputs["attn_metadata"],
             "spec_metadata": spec_metadata,
+            "lora_metadata": initial_inputs.get("lora_metadata", None),
         }
 
         # We have to do warm up runs to initialize PyTorch's
@@ -178,11 +193,22 @@ class CUDAGraphRunner:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
         graph = torch.cuda.CUDAGraph()
+        #graph.enable_debug_mode()
         with with_multi_stream(True), piecewise_cuda_graph(False):
+            print(f"ZUKER - CudaGraphRunner.capture - warmup - {capture_inputs.keys()=}")
+            #if "lora_metadata" in capture_inputs:
+            #    print(f"ZUKER - CudaGraphRunner.capture - pre warmup - {capture_inputs["lora_metadata"]=}")
             for _ in range(self.WARMUP_STEPS):
                 forward_fn(capture_inputs)
+            #print(f"ZUKER - CudaGraphRunner.capture - post warmup - {capture_inputs["lora_metadata"]=}")
+            print(f"ZUKER - CudaGraphRunner.capture - capturing {batch_size=}")
             with torch.cuda.graph(graph, pool=self.memory_pool):
+                print("ZUKER - INSIDE torch.cuda.graph@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
                 output = forward_fn(capture_inputs)
+                print(f"ZUKER - INSIDE torch.cuda.graph - {output.keys()=}")
+            print("ZUKER - CudaGraphRunner.capture - finished capturing")
+        #graph.debug_dump("./cuda_graph_debug")
+        #graph.disable_debug_mode()
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
@@ -212,7 +238,9 @@ class CUDAGraphRunner:
             static_tensors["mrope_position_deltas"][:batch_size].copy_(
                 current_inputs["mrope_position_deltas"])
 
+        print(f"ZUKER - CudaGraphRunner.replay - {batch_size=}, {current_inputs.get("lora_metadata", None) is not None=}")
         self.graphs[key].replay()
+        print("ZUKER - CudaGraphRunner.replay - finished replaying")
         output_ref = self.graph_outputs[key]
 
         return output_ref

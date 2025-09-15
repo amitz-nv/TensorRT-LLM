@@ -293,7 +293,7 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     auto bestTactic = mPluginProfiler->getBestConfig(numTokens, mGemmId);
     mLoraImpl->setBestTactic(bestTactic);
     mLoraImpl->run(numTokens, numReqs, input, mExpandLoraRanks.data(), mExpandLoraWeightPtrs.data(), mWeightIndex,
-        outputs, workspace, stream);
+        outputs, workspace, nullptr, workspace, nullptr, stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return 0;

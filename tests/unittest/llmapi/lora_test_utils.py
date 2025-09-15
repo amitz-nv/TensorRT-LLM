@@ -67,6 +67,7 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
                 for output, ref in zip(
                         outputs, references[last_idx:last_idx + adapter_count] *
                         repeats_per_call):
+                    print(f"{output.outputs[0].text=}")
                     assert similar(output.outputs[0].text, ref)
                 last_idx += adapter_count
     finally:

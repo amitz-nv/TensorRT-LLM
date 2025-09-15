@@ -85,13 +85,16 @@ class LoraModuleType(IntEnum):
 class LoraLayer(torch.nn.Module):
 
     def __init__(self, lora_module_types: List[LoraModuleType],
-                 output_hidden_sizes: List[int]):
+                 output_hidden_sizes: List[int],
+                 layer_idx: int):
         super().__init__()
 
         self.lora_module_types = lora_module_types
         self.output_hidden_sizes = output_hidden_sizes
+        self.layer_idx = layer_idx
         assert len(lora_module_types) == len(output_hidden_sizes)
 
+        """
         if self.output_hidden_sizes:
             #print(f"ZUKER - LoraLayer.__init__ - {self.output_hidden_sizes=}")
             # TODO: Does device="cuda" work with TP>1?
@@ -109,36 +112,71 @@ class LoraLayer(torch.nn.Module):
             self._output_tensors_ptrs = [
                 t.data_ptr() for t in self._output_tensors
             ]
+        """
+
+    def get_lora_ranks_weight_pointers_and_active_lora_module_ids(self, lora_params: Dict) -> tuple[list[int], list[int], list[int]]:
+        lora_ranks = []
+        lora_weight_pointers = []
+        active_lora_module_ids = []
+        for module_idx in self.lora_module_types:
+            module_idx = int(module_idx)
+            if module_idx in lora_params[self.layer_idx]:
+                active_lora_module_ids.append(module_idx)
+                lora_ranks.append(
+                    lora_params[self.layer_idx][module_idx]['adapter_size'])
+                lora_weight_pointers.append(
+                    lora_params[self.layer_idx][module_idx]['weight_pointers'])
+        return lora_ranks, lora_weight_pointers, active_lora_module_ids
+
+    def get_lora_ranks_weight_pointers_of_lora_module_types(self, lora_params: Dict, zero_adapter_size: int, zero_weight_in_ptr: int, zero_weight_out_ptr: int) -> tuple[list[int], list[int], list[int]]:
+        lora_ranks = []
+        lora_weight_pointers = []
+        active_lora_module_ids = []
+        for module_idx in self.lora_module_types:
+            module_idx = int(module_idx)
+            if module_idx in lora_params[self.layer_idx]:
+                active_lora_module_ids.append(module_idx)
+                lora_ranks.append(
+                    lora_params[self.layer_idx][module_idx]['adapter_size'])
+                lora_weight_pointers.append(
+                    lora_params[self.layer_idx][module_idx]['weight_pointers'])
+            else:
+                lora_ranks.append(torch.IntTensor([zero_adapter_size]))
+                lora_weight_pointers.append(torch.LongTensor([zero_weight_in_ptr, zero_weight_out_ptr, 0]))
+        return lora_ranks, lora_weight_pointers, active_lora_module_ids
 
     def forward(
         self,
         x,
         lora_params: Dict,
-        layer_idx: int,
     ) -> Optional[torch.Tensor]:
-
+        print("ZUKER - LoraLayer.forward - start")
         if bool(lora_params):
-            #print(f"ZUKER - LoraLayer.forward - {x.dtype=}, {layer_idx=}, {lora_params[layer_idx]=}")
-            lora_ranks = []
-            lora_weight_pointers = []
-            active_lora_module_ids = []
-            for module_idx in self.lora_module_types:
-                module_idx = int(module_idx)
-                if module_idx in lora_params[layer_idx]:
-                    #print(f"ZUKER - LoraLayer.forward - {layer_idx=}, {module_idx=}")
-                    active_lora_module_ids.append(module_idx)
-                    lora_ranks.append(
-                        lora_params[layer_idx][module_idx]['adapter_size'])
-                    lora_weight_pointers.append(
-                        lora_params[layer_idx][module_idx]['weight_pointers'])
+            #print(f"ZUKER - LoraLayer.forward - {x.dtype=}, {self.layer_idx=}, {lora_params[self.layer_idx]=}")
+            lora_ranks, lora_weight_pointers, active_lora_module_ids = \
+                self.get_lora_ranks_weight_pointers_and_active_lora_module_ids(lora_params)
+
+            # Values are present only when CUDA graphs are enabled
+            cuda_graphs_metadata = lora_params[self.layer_idx].get(tuple(self.output_hidden_sizes), {})
+            output_tensors = cuda_graphs_metadata.get('output_tensors', None)
+            output_tensors_ptrs = cuda_graphs_metadata.get('output_tensors_ptrs', None)
+            workspace_tensor_device_group_gemm1 = cuda_graphs_metadata.get('workspace_tensor_device_splitk_group_gemm', None)
+            workspace_tensor_host_group_gemm1 = cuda_graphs_metadata.get('workspace_tensor_host_splitk_group_gemm', None)
+            workspace_tensor_device_group_gemm2: torch.Tensor = cuda_graphs_metadata.get('workspace_tensor_device_group_gemm', None)
+            workspace_tensor_host_group_gemm2 = cuda_graphs_metadata.get('workspace_tensor_host_group_gemm', None)
+
+            self.input_tensor = x
+            print(f"ZUKER - LoraLayer.forward - {self.layer_idx=}, {self.output_hidden_sizes=}, {hex(x.data_ptr())=}")
 
             num_seqs = lora_params['num_seqs']
 
             if len(active_lora_module_ids) == 0:
+                print("ZUKER - LoraLayer.forward - no active_lora_module_ids, returning None")
                 return None
             else:
-                #print(f"ZUKER - LoraLayer.forward - {num_seqs=}, {x.shape=}, {lora_ranks=}")
-                torch.ops.trtllm.lora_grouped_gemm(
+                print(f"ZUKER - LoraLayer.forward - {num_seqs=}, {self.lora_module_types=}, {x.shape=}")
+                print("ZUKER - LoraLayer.forward - calling lora_grouped_gemm")
+                lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
                     x,
                     lora_params['host_request_types'][:num_seqs],
                     lora_ranks,
@@ -147,14 +185,24 @@ class LoraLayer(torch.nn.Module):
                     self.output_hidden_sizes,
                     False,  # transA
                     True,  # transB
-                    8,  #max([r.max() for r in lora_ranks]),
+                    max([r.max() for r in lora_ranks]),
                     0,
-                    True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
-                    self._output_tensors_ptrs,  # output_ptrs
-                    self._workspace_tensor,  # workspace_tensor
+                    output_tensors is None,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
+                    output_tensors_ptrs,
+                    workspace_tensor_device_group_gemm1,
+                    workspace_tensor_host_group_gemm1,
+                    workspace_tensor_device_group_gemm2,
+                    workspace_tensor_host_group_gemm2,
                 )
-                lora_outputs = self._output_tensors[:len(self.
-                                                         output_hidden_sizes)]
+                #print(f"ZUKER - LoraLayer.forward - {self.layer_idx=}, {output_tensors=}, {workspace_tensor=}")
+                #print(f"ZUKER - LoraLayer.forward - {lora_params[self.layer_idx].keys()=}")
+                if output_tensors is not None:
+                    # working version:
+                    lora_outputs = output_tensors[:len(self.output_hidden_sizes)]
+                    print(f"ZUKER - LoraLayer.forward - lora_outputs shapes - {[t.shape for t in lora_outputs]=}")
+                    return torch.cat(lora_outputs, dim=-1)[:x.shape[0]]
+                    # test version:
+                    #lora_outputs = output_tensors[:len(active_lora_module_ids)]
                 #print(f"ZUKER - LoraLayer.forward - {self.output_hidden_sizes=}")
                 #print(f"ZUKER - LoraLayer.forward - {[hex(a) for a in self._output_tensors_ptrs]}")
                 #print(f"ZUKER - LoraLayer.forward - {lora_outputs=}")
@@ -168,11 +216,17 @@ class LoraLayer(torch.nn.Module):
                 #       anything for ATTENTION_K
                 lora_output = []
                 idx = 0
+                #if isinstance(lora_outputs, torch.Tensor):
+                #    print(f"ZUKER - LoraLayer.forward - {lora_outputs.shape=}")
+                #else:
+                #    print(f"ZUKER - LoraLayer.forward - {len(lora_outputs)=}")
                 for module_idx in self.lora_module_types:
                     if int(module_idx) in active_lora_module_ids:
+                        print(f"ZUKER - LoraLayer.forward - Adding lora output for module {module_idx}, {idx=}")
                         lora_output.append(lora_outputs[idx][:x.shape[0]])
                         idx += 1
                     else:
+                        print(f"ZUKER - LoraLayer.forward - Adding zeros as lora output for module {module_idx}, {idx=}")
                         lora_output.append(
                             torch.zeros(list(x.shape[:-1]) + [
                                 self.output_hidden_sizes[
@@ -180,7 +234,7 @@ class LoraLayer(torch.nn.Module):
                             ],
                                         dtype=x.dtype,
                                         device=x.device))
-                #print(f"ZUKER - LoraLayer.forward - {[w.shape for w in lora_output]=}")
+                print(f"ZUKER - LoraLayer.forward - {[w.shape for w in lora_output]=}")
                 lora_output = torch.cat(lora_output, dim=-1)
                 return lora_output
 
